@@ -39,7 +39,7 @@
 - `PUT /line` : ライン座標を更新。ボディに `{ "start": {"x": 0.5, "y": 0.2}, "end": {"x": 0.5, "y": 0.8} }` のような正規化座標を渡します。
 - `WEBSOCKET /ws/status` : ライン変更やカウント更新をリアルタイム配信。
 
-ライン設定とカウンタは `backend/state.json` に永続化され、アプリ再起動後も前回の値を復元します。
+ライン設定とカウンタは既定で `backend/state.json` に永続化され、アプリ再起動後も前回の値を復元します。環境変数 `LINE_COUNTER_STATE_PATH` を指定すると保存先を任意に切り替えられます。
 
 ### フロントエンド (React + Vite)
 1. 依存関係をインストールします。
@@ -63,6 +63,23 @@ npm run build
 > フロントエンドは既定で `http://localhost:8000` を参照します。別ホスト／ポートでバックエンドを起動する場合は、環境変数 `VITE_BACKEND_URL` を設定してから `npm run dev` または `npm run build` を実行してください。
 >
 > 例: `VITE_BACKEND_URL=http://192.168.0.10:8000 npm run dev`
+
+## Docker での実行
+1. Docker と Docker Compose が利用できる環境を用意します。Linux で USB カメラを利用する場合は、ホストの `/dev/video0` などデバイスファイルにアクセスできることを確認してください。
+2. ルートディレクトリで以下を実行し、バックエンド・フロントエンドを同時に起動します。
+   ```bash
+   docker compose up --build
+   ```
+3. フロントエンドは `http://localhost:5423`、バックエンド API は `http://localhost:8000` に公開されます。
+
+### コンテナ構成
+- `backend` サービス: `python:3.11-slim` ベース。`uvicorn` で FastAPI アプリを 8000 番ポートで起動します。環境変数 `LINE_COUNTER_STATE_PATH=/data/state.json` を介して状態ファイルをボリューム `backend_state` に保存します。
+- `frontend` サービス: Node.js でビルドした静的ファイルを Nginx (5423 番ポート) から配信します。ビルド時に `VITE_BACKEND_URL` ビルド引数でバックエンド URL を埋め込みます（既定は `http://localhost:8000`）。
+
+### オプション設定
+- 他のホスト・ポートでバックエンドを公開する場合は、`docker-compose.yml` の `frontend.build.args.VITE_BACKEND_URL` を変更してください。
+- カメラデバイスが `/dev/video0` 以外の場合や Windows/macOS で USB カメラを共有する場合は、`devices` やプラットフォーム固有の共有設定を調整してください。カメラを利用しない開発用途では `devices` 行をコメントアウトしても動作します。
+- 状態ファイルを初期化したい場合は、コンテナ停止後に `docker volume rm count_visitor_backend_state` を実行するとリセットできます。
 
 ## フロントエンドの主な機能
 - `/stream` を `<video>` 要素で表示し、同サイズの SVG オーバーレイを重ねてライン位置を視覚化。

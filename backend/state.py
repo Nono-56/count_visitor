@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from dataclasses import dataclass, field
 import json
 import logging
+import os
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -61,7 +62,14 @@ class LineCounterState:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self.cross_cooldown_seconds = 0.75
         self.track_ttl_seconds = 2.0
-        self._state_file = Path(state_file) if state_file else Path(__file__).resolve().parent / "state.json"
+        if state_file:
+            self._state_file = Path(state_file)
+        else:
+            env_path = os.getenv("LINE_COUNTER_STATE_PATH")
+            if env_path:
+                self._state_file = Path(env_path)
+            else:
+                self._state_file = Path(__file__).resolve().parent / "state.json"
         self._ensure_state_dir()
         self._load_state()
 
