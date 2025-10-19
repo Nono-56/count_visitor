@@ -70,11 +70,12 @@ npm run build
    ```bash
    docker compose up --build
    ```
+   最新のベースイメージを取り込む場合は、`docker compose build --pull` を併用してください。
 3. フロントエンドは `http://localhost:5423`、バックエンド API は `http://localhost:8000` に公開されます。
 
 ### コンテナ構成
-- `backend` サービス: `python:3.11-slim` ベース。`uvicorn` で FastAPI アプリを 8000 番ポートで起動します。環境変数 `LINE_COUNTER_STATE_PATH=/data/state.json` を介して状態ファイルをボリューム `backend_state` に保存します。
-- `frontend` サービス: Node.js でビルドした静的ファイルを Nginx (5423 番ポート) から配信します。ビルド時に `VITE_BACKEND_URL` ビルド引数でバックエンド URL を埋め込みます（既定は `http://localhost:8000`）。
+- `backend` サービス: `python:3.11-slim-bookworm` ベース。起動時に OS のセキュリティ更新を適用したうえで `uvicorn` で FastAPI アプリを 8000 番ポートで公開します。環境変数 `LINE_COUNTER_STATE_PATH=/data/state.json` を介して状態ファイルをボリューム `backend_state` に保存します。
+- `frontend` サービス: `node:20-alpine` でビルドし、`nginx:1.27-alpine`（起動時に `apk upgrade` 済み）で静的ファイルを 5423 番ポートから配信します。ビルド時に `VITE_BACKEND_URL` ビルド引数でバックエンド URL を埋め込みます（既定は `http://localhost:8000`）。
 
 ### オプション設定
 - 他のホスト・ポートでバックエンドを公開する場合は、`docker-compose.yml` の `frontend.build.args.VITE_BACKEND_URL` を変更してください。

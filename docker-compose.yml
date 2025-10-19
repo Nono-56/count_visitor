@@ -3,6 +3,7 @@ services:
     build:
       context: .
       dockerfile: backend/Dockerfile
+      pull: true
     ports:
       - "8000:8000"
     environment:
@@ -19,6 +20,7 @@ services:
       dockerfile: frontend/Dockerfile
       args:
         VITE_BACKEND_URL: http://localhost:8000
+      pull: true
     ports:
       - "5423:5423"
     depends_on:

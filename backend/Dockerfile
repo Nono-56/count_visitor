@@ -1,4 +1,4 @@
-FROM python:3.11-slim AS base
+FROM python:3.11-slim-bookworm AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
@@ -6,6 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN apt-get update && \
+    apt-get -y upgrade && \
     apt-get install --no-install-recommends -y \
       libgl1 \
       libglib2.0-0 \
@@ -23,4 +24,3 @@ COPY backend ./backend
 EXPOSE 8000
 
 CMD ["uvicorn", "backend.app:app", "--host", "0.0.0.0", "--port", "8000"]
-
