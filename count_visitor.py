@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import json
 import signal
 import sys
 import time
+import threading
 from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+import socket
 from typing import Dict, Optional, Tuple
 
 import cv2
@@ -39,6 +44,10 @@ class AppConfig:
     handle_radius_px: int = 12
     # ハンドルを掴める当たり判定半径（ピクセル単位）。
     handle_hit_radius_px: int = 24
+    # Web インターフェースのバインドホスト。
+    web_host: str = "0.0.0.0"
+    # Web インターフェースのポート。
+    web_port: int = 5000
 
 
 # アプリのデフォルト設定。ここを変更すれば全体の初期値をまとめて調整できる。
@@ -69,6 +78,135 @@ def _parse_ratio(value: str) -> float:
     if not (0.0 <= ratio <= 1.0):
         raise argparse.ArgumentTypeError("正規化座標は 0.0 ～ 1.0 の範囲で指定してください。")
     return ratio
+
+
+def _handle_center_y(height: int, handle_radius: int) -> int:
+    return max(height - handle_radius * 3, handle_radius)
+
+
+def _enumerate_local_addresses() -> Tuple[str, ...]:
+    candidates: set[str] = set()
+    try:
+        hostname = socket.gethostname()
+        _, _, ips = socket.gethostbyname_ex(hostname)
+        candidates.update(ip for ip in ips if "." in ip and not ip.startswith("127."))
+    except socket.gaierror:
+        pass
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            if ip and "." in ip and not ip.startswith("127."):
+                candidates.add(ip)
+    except OSError:
+        pass
+    if not candidates:
+        return ()
+    return tuple(sorted(candidates))
+
+
+class CountPublisher:
+    def __init__(self) -> None:
+        self._counts: Dict[str, int] = {"right_to_left": 0, "left_to_right": 0}
+        self._lock = threading.Lock()
+
+    def update(self, counts: Dict[str, int]) -> None:
+        with self._lock:
+            self._counts = dict(counts)
+
+    def snapshot(self) -> Dict[str, int]:
+        with self._lock:
+            return dict(self._counts)
+
+
+def start_count_http_server(
+    publisher: CountPublisher,
+    host: str,
+    port: int,
+) -> Tuple[HTTPServer, threading.Thread]:
+    class _CountsRequestHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            if self.path in ("/", "/index.html"):
+                html = """<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Visitor Counter</title>
+  <style>
+    body { font-family: sans-serif; background: #111; color: #f5f5f5; display: flex; flex-direction: column; align-items: center; gap: 1.5rem; padding-top: 3rem; }
+    .panel { background: #1e1e1e; padding: 1.5rem 2rem; border-radius: 12px; box-shadow: 0 0 20px rgba(0, 0, 0, 0.3); min-width: 320px; }
+    h1 { margin: 0 0 0.5rem; font-size: 1.8rem; text-align: center; }
+    .count { font-size: 1.5rem; margin: 0.75rem 0; display: flex; justify-content: space-between; }
+    .label { color: #aaa; }
+    .value { font-weight: bold; }
+    .timestamp { font-size: 0.9rem; color: #888; text-align: right; }
+  </style>
+</head>
+<body>
+  <div class="panel">
+    <h1>Visitor Counter</h1>
+    <div class="count"><span class="label">Right → Left</span><span class="value" id="rtl-value">0</span></div>
+    <div class="count"><span class="label">Left → Right</span><span class="value" id="ltr-value">0</span></div>
+    <div class="timestamp">最終更新: <span id="updated-at">-</span></div>
+  </div>
+  <script>
+    async function refreshCounts() {
+      try {
+        const res = await fetch("/api/counts", { cache: "no-store" });
+        if (!res.ok) throw new Error("Failed to fetch counts");
+        const data = await res.json();
+        const counts = data.counts || {};
+        document.getElementById("rtl-value").textContent = counts.right_to_left ?? 0;
+        document.getElementById("ltr-value").textContent = counts.left_to_right ?? 0;
+        const ts = data.timestamp ? new Date(data.timestamp * 1000) : null;
+        document.getElementById("updated-at").textContent = ts ? ts.toLocaleString() : "-";
+      } catch (error) {
+        console.error(error);
+      }
+    }
+    refreshCounts();
+    setInterval(refreshCounts, 1000);
+  </script>
+</body>
+</html>"""
+                payload = html.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            elif self.path == "/api/counts":
+                snapshot = publisher.snapshot()
+                payload = json.dumps({"counts": snapshot, "timestamp": time.time()}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            else:
+                message = b"Not Found"
+                self.send_response(404)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(message)))
+                self.end_headers()
+                self.wfile.write(message)
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
+    server = _ThreadingHTTPServer((host, port), _CountsRequestHandler)
+    thread = threading.Thread(
+        target=server.serve_forever,
+        daemon=True,
+        name="CountHTTPServer",
+    )
+    thread.start()
+    return server, thread
 
 
 @dataclass
@@ -196,6 +334,7 @@ def draw_overlay(
 
     handle_radius = max(3, config.handle_radius_px)
     thickness = max(1, config.line_thickness_px)
+    handle_y = _handle_center_y(height, handle_radius)
 
     overlay = display.copy()
     cv2.rectangle(
@@ -223,7 +362,6 @@ def draw_overlay(
         cv2.LINE_AA,
     )
 
-    handle_y = height // 2
     cv2.circle(display, (left_px, handle_y), handle_radius, (255, 140, 0), -1, cv2.LINE_AA)
     cv2.circle(display, (right_px, handle_y), handle_radius, (255, 140, 0), -1, cv2.LINE_AA)
 
@@ -293,7 +431,8 @@ class LineEditor:
     def _nearest_handle(self, x: int, y: int) -> Optional[str]:
         width, height = self.frame_size
         left_px, right_px = self.counter.zone_pixels((width, height))
-        handle_y = height // 2
+        handle_radius = max(3, self.config.handle_radius_px)
+        handle_y = _handle_center_y(height, handle_radius)
         left_dist = np.linalg.norm(np.array([left_px, handle_y]) - np.array([x, y]))
         right_dist = np.linalg.norm(np.array([right_px, handle_y]) - np.array([x, y]))
         threshold = self.handle_hit_radius
@@ -385,6 +524,17 @@ def parse_args(defaults: AppConfig) -> AppConfig:
         default=defaults.handle_hit_radius_px,
         help="ハンドルのドラッグ判定半径 (px)",
     )
+    parser.add_argument(
+        "--web-host",
+        default=defaults.web_host,
+        help="Web インターフェースのバインドホスト (例: 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--web-port",
+        type=int,
+        default=defaults.web_port,
+        help="Web インターフェースのポート番号",
+    )
 
     args = parser.parse_args()
 
@@ -401,6 +551,8 @@ def parse_args(defaults: AppConfig) -> AppConfig:
         line_thickness_px=args.line_thickness,
         handle_radius_px=args.handle_radius,
         handle_hit_radius_px=args.handle_hit_radius,
+        web_host=args.web_host,
+        web_port=args.web_port,
     )
 
 
@@ -414,8 +566,35 @@ def main() -> None:
         cross_cooldown_seconds=config.cross_cooldown_seconds,
         track_ttl_seconds=config.track_ttl_seconds,
     )
+    publisher = CountPublisher()
+    publisher.update(counter.counts)
 
     stop_requested = False
+
+    server: Optional[HTTPServer] = None
+    server_thread: Optional[threading.Thread] = None
+    try:
+        server, server_thread = start_count_http_server(
+            publisher,
+            config.web_host,
+            config.web_port,
+        )
+        if config.web_host in ("0.0.0.0", ""):
+            local_addresses = _enumerate_local_addresses()
+            if local_addresses:
+                ips_text = ", ".join(f"http://{addr}:{config.web_port}/" for addr in local_addresses)
+                print(f"[INFO] Web インターフェースを起動しました: {ips_text}")
+            else:
+                print(
+                    f"[INFO] Web インターフェースを起動しました: http://localhost:{config.web_port}/ "
+                    "（同一ネットワークからアクセスする場合はこの端末の IP アドレスを利用してください）"
+                )
+        else:
+            print(
+                f"[INFO] Web インターフェースを起動しました: http://{config.web_host}:{config.web_port}/"
+            )
+    except OSError as exc:
+        print(f"[WARN] Web サーバーを起動できませんでした: {exc}", file=sys.stderr)
 
     line_editor = LineEditor(counter, config)
     line_editor.register()
@@ -501,6 +680,8 @@ def main() -> None:
                         cv2.LINE_AA,
                     )
 
+            publisher.update(counter.counts)
+
             frame_with_overlay = draw_overlay(frame, counter, counter.counts, config)
             cv2.imshow(line_editor.window_name, frame_with_overlay)
 
@@ -509,9 +690,15 @@ def main() -> None:
                 break
             if key in (ord("r"), ord("R")):
                 counter.reset_counts()
+                publisher.update(counter.counts)
     except KeyboardInterrupt:
         pass
     finally:
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+            if server_thread is not None:
+                server_thread.join(timeout=2.0)
         cv2.destroyAllWindows()
 
 
