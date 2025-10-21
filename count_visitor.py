@@ -19,10 +19,10 @@ class AppConfig:
     source: str | int = 0
     # Ultralytics YOLO のモデル名もしくはファイルパス。軽量な yolov8n.pt を既定にする。
     model: str = "yolov8n.pt"
-    # ライン始点の正規化座標 (0.0-1.0)。映像左上が (0,0)、右下が (1,1)。
-    line_start: Tuple[float, float] = (0.5, 0.2)
-    # ライン終点の正規化座標 (0.0-1.0)。
-    line_end: Tuple[float, float] = (0.5, 0.8)
+    # カウント領域左端の正規化 x 座標 (0.0-1.0)。
+    zone_left: float = 0.4
+    # カウント領域右端の正規化 x 座標 (0.0-1.0)。
+    zone_right: float = 0.6
     # 描画時のフレーム幅。0 を指定すると入力映像の解像度を維持する。
     width: int = 960
     # YOLO 推論を走らせるデバイス (例: "cpu", "cuda:0")。None の場合は自動判定。
@@ -59,42 +59,22 @@ def _parse_source(value: str) -> str | int:
     except ValueError:
         return value
 
-def _parse_point(value: str) -> Tuple[float, float]:
+def _parse_ratio(value: str) -> float:
     try:
-        x_str, y_str = value.split(",")
-        x, y = float(x_str), float(y_str)
+        ratio = float(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(
-            f"座標 '{value}' は '0.5,0.8' のような形式で指定してください。"
+            f"正規化座標 '{value}' は 0.0～1.0 の小数で指定してください。"
         ) from exc
-    if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
-        raise argparse.ArgumentTypeError("ライン座標は 0.0 ～ 1.0 の範囲で指定してください。")
-    return (x, y)
-
-
-def _normalize_sign(value: float, tolerance: float = 1e-6) -> int:
-    if value > tolerance:
-        return 1
-    if value < -tolerance:
-        return -1
-    return 0
-
-
-def _line_side(
-    point: Tuple[float, float],
-    line_start: Tuple[float, float],
-    line_end: Tuple[float, float],
-) -> int:
-    x, y = point
-    x1, y1 = line_start
-    x2, y2 = line_end
-    orientation = (x2 - x1) * (y - y1) - (y2 - y1) * (x - x1)
-    return _normalize_sign(orientation)
+    if not (0.0 <= ratio <= 1.0):
+        raise argparse.ArgumentTypeError("正規化座標は 0.0 ～ 1.0 の範囲で指定してください。")
+    return ratio
 
 
 @dataclass
 class TrackState:
-    last_sign: Optional[int] = None
+    last_zone: Optional[str] = None
+    entry_side: Optional[str] = None
     last_seen: float = field(default_factory=time.time)
     last_cross_timestamp: float = 0.0
 
@@ -102,13 +82,13 @@ class TrackState:
 class LineCrossCounter:
     def __init__(
         self,
-        line_start: Tuple[float, float],
-        line_end: Tuple[float, float],
+        zone_left: float,
+        zone_right: float,
         *,
         cross_cooldown_seconds: float = 0.75,
         track_ttl_seconds: float = 2.0,
     ) -> None:
-        self._line_normalized = (line_start, line_end)
+        self._zone_normalized = self._normalize_zone(zone_left, zone_right)
         self._counts = {"right_to_left": 0, "left_to_right": 0}
         self._tracks: Dict[int, TrackState] = {}
         self.cross_cooldown_seconds = cross_cooldown_seconds
@@ -119,27 +99,22 @@ class LineCrossCounter:
         return dict(self._counts)
 
     @property
-    def line_normalized(self) -> Tuple[Tuple[float, float], Tuple[float, float]]:
-        return self._line_normalized
+    def zone_normalized(self) -> Tuple[float, float]:
+        return self._zone_normalized
 
-    def update_line(self, start: Tuple[float, float], end: Tuple[float, float]) -> None:
-        self._line_normalized = (
-            (_clamp01(start[0]), _clamp01(start[1])),
-            (_clamp01(end[0]), _clamp01(end[1])),
-        )
+    def update_zone(self, left: float, right: float) -> None:
+        self._zone_normalized = self._normalize_zone(left, right)
         self._tracks.clear()
 
     def reset_counts(self) -> None:
         self._counts = {"right_to_left": 0, "left_to_right": 0}
         self._tracks.clear()
 
-    def line_pixels(self, frame_size: Tuple[int, int]) -> Tuple[Tuple[int, int], Tuple[int, int]]:
-        width, height = frame_size
-        (nx1, ny1), (nx2, ny2) = self._line_normalized
-        return (
-            (int(nx1 * width), int(ny1 * height)),
-            (int(nx2 * width), int(ny2 * height)),
-        )
+    def zone_pixels(self, frame_size: Tuple[int, int]) -> Tuple[int, int]:
+        width = max(frame_size[0], 1)
+        left, right = self._zone_normalized
+        max_index = max(width - 1, 0)
+        return (int(round(left * max_index)), int(round(right * max_index)))
 
     def observe(
         self,
@@ -149,29 +124,42 @@ class LineCrossCounter:
     ) -> None:
         self._prune_stale_tracks()
 
-        line_start_px, line_end_px = self.line_pixels(frame_size)
-        current_sign = _line_side(centroid, line_start_px, line_end_px)
+        left_px, right_px = self.zone_pixels(frame_size)
+        x, _ = centroid
+        if x < left_px:
+            current_zone = "left"
+        elif x > right_px:
+            current_zone = "right"
+        else:
+            current_zone = "inside"
         now = time.time()
 
         track = self._tracks.setdefault(int(track_id), TrackState())
         track.last_seen = now
 
-        previous_sign = track.last_sign
-        if (
-            previous_sign is not None
-            and previous_sign != 0
-            and current_sign != 0
-            and current_sign != previous_sign
-            and now - track.last_cross_timestamp > self.cross_cooldown_seconds
-        ):
-            if previous_sign < current_sign:
-                self._counts["right_to_left"] += 1
-            else:
-                self._counts["left_to_right"] += 1
-            track.last_cross_timestamp = now
+        previous_zone = track.last_zone
 
-        if current_sign != 0 or track.last_sign is None:
-            track.last_sign = current_sign
+        if (
+            current_zone == "inside"
+            and track.entry_side is None
+            and previous_zone in ("left", "right")
+        ):
+            track.entry_side = previous_zone
+
+        if current_zone in ("left", "right"):
+            if (
+                track.entry_side
+                and track.entry_side != current_zone
+                and now - track.last_cross_timestamp > self.cross_cooldown_seconds
+            ):
+                if track.entry_side == "right" and current_zone == "left":
+                    self._counts["right_to_left"] += 1
+                elif track.entry_side == "left" and current_zone == "right":
+                    self._counts["left_to_right"] += 1
+                track.last_cross_timestamp = now
+            track.entry_side = None
+
+        track.last_zone = current_zone
 
     def _prune_stale_tracks(self) -> None:
         now = time.time()
@@ -183,6 +171,14 @@ class LineCrossCounter:
         for track_id in stale_ids:
             self._tracks.pop(track_id, None)
 
+    @staticmethod
+    def _normalize_zone(left: float, right: float) -> Tuple[float, float]:
+        left_clamped = _clamp01(left)
+        right_clamped = _clamp01(right)
+        if left_clamped <= right_clamped:
+            return (left_clamped, right_clamped)
+        return (right_clamped, left_clamped)
+
 
 def draw_overlay(
     frame: np.ndarray,
@@ -192,14 +188,44 @@ def draw_overlay(
 ) -> np.ndarray:
     display = frame.copy()
     height, width = display.shape[:2]
-    start_px, end_px = counter.line_pixels((width, height))
+    left_px, right_px = counter.zone_pixels((width, height))
+    left_px = max(0, min(left_px, max(width - 1, 0)))
+    right_px = max(0, min(right_px, max(width - 1, 0)))
+    if right_px < left_px:
+        left_px, right_px = right_px, left_px
 
     handle_radius = max(3, config.handle_radius_px)
     thickness = max(1, config.line_thickness_px)
 
-    cv2.circle(display, start_px, handle_radius, (255, 140, 0), -1, cv2.LINE_AA)
-    cv2.circle(display, end_px, handle_radius, (255, 140, 0), -1, cv2.LINE_AA)
-    cv2.line(display, start_px, end_px, (0, 255, 255), thickness, cv2.LINE_AA)
+    overlay = display.copy()
+    cv2.rectangle(
+        overlay,
+        (left_px, 0),
+        (right_px, max(height - 1, 0)),
+        (0, 255, 255),
+        -1,
+    )
+    cv2.addWeighted(overlay, 0.2, display, 0.8, 0, display)
+    cv2.line(
+        display,
+        (left_px, 0),
+        (left_px, max(height - 1, 0)),
+        (0, 255, 255),
+        thickness,
+        cv2.LINE_AA,
+    )
+    cv2.line(
+        display,
+        (right_px, 0),
+        (right_px, max(height - 1, 0)),
+        (0, 255, 255),
+        thickness,
+        cv2.LINE_AA,
+    )
+
+    handle_y = height // 2
+    cv2.circle(display, (left_px, handle_y), handle_radius, (255, 140, 0), -1, cv2.LINE_AA)
+    cv2.circle(display, (right_px, handle_y), handle_radius, (255, 140, 0), -1, cv2.LINE_AA)
 
     cv2.putText(
         display,
@@ -223,7 +249,7 @@ def draw_overlay(
     )
     cv2.putText(
         display,
-        "Drag endpoints to adjust line | R: reset counts | Q/Esc: exit",
+        "Drag handles to adjust area | R: reset counts | Q/Esc: exit",
         (10, max(height - 20, 25)),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.5,
@@ -259,29 +285,30 @@ class LineEditor:
                 self.active_handle = handle
                 self.dragging = True
         elif event == cv2.EVENT_MOUSEMOVE and self.dragging and self.active_handle:
-            self._update_line(self.active_handle, x, y)
+            self._update_zone(self.active_handle, x)
         elif event == cv2.EVENT_LBUTTONUP:
             self.active_handle = None
             self.dragging = False
 
     def _nearest_handle(self, x: int, y: int) -> Optional[str]:
         width, height = self.frame_size
-        start_px, end_px = self.counter.line_pixels((width, height))
-        start_dist = np.linalg.norm(np.array(start_px) - np.array([x, y]))
-        end_dist = np.linalg.norm(np.array(end_px) - np.array([x, y]))
+        left_px, right_px = self.counter.zone_pixels((width, height))
+        handle_y = height // 2
+        left_dist = np.linalg.norm(np.array([left_px, handle_y]) - np.array([x, y]))
+        right_dist = np.linalg.norm(np.array([right_px, handle_y]) - np.array([x, y]))
         threshold = self.handle_hit_radius
-        if start_dist <= threshold or end_dist <= threshold:
-            return "start" if start_dist <= end_dist else "end"
+        if left_dist <= threshold or right_dist <= threshold:
+            return "left" if left_dist <= right_dist else "right"
         return None
 
-    def _update_line(self, handle: str, x: int, y: int) -> None:
-        width, height = self.frame_size
-        normalized = (_clamp01(x / width), _clamp01(y / height))
-        start, end = self.counter.line_normalized
-        if handle == "start":
-            self.counter.update_line(normalized, end)
+    def _update_zone(self, handle: str, x: int) -> None:
+        width = max(self.frame_size[0], 1)
+        normalized_x = _clamp01(x / width)
+        left, right = self.counter.zone_normalized
+        if handle == "left":
+            self.counter.update_zone(normalized_x, right)
         else:
-            self.counter.update_line(start, normalized)
+            self.counter.update_zone(left, normalized_x)
 
 
 
@@ -300,16 +327,16 @@ def parse_args(defaults: AppConfig) -> AppConfig:
         help="YOLOv8 モデルパスまたはモデル名",
     )
     parser.add_argument(
-        "--line-start",
-        default=f"{defaults.line_start[0]},{defaults.line_start[1]}",
-        type=_parse_point,
-        help="ライン始点 (正規化座標, 例: 0.5,0.2)",
+        "--zone-left",
+        default=defaults.zone_left,
+        type=_parse_ratio,
+        help="カウント領域左端の正規化 x 座標 (0.0-1.0)",
     )
     parser.add_argument(
-        "--line-end",
-        default=f"{defaults.line_end[0]},{defaults.line_end[1]}",
-        type=_parse_point,
-        help="ライン終点 (正規化座標, 例: 0.5,0.8)",
+        "--zone-right",
+        default=defaults.zone_right,
+        type=_parse_ratio,
+        help="カウント領域右端の正規化 x 座標 (0.0-1.0)",
     )
     parser.add_argument(
         "--width",
@@ -361,19 +388,11 @@ def parse_args(defaults: AppConfig) -> AppConfig:
 
     args = parser.parse_args()
 
-    line_start = args.line_start
-    if not isinstance(line_start, tuple):
-        line_start = _parse_point(line_start)
-
-    line_end = args.line_end
-    if not isinstance(line_end, tuple):
-        line_end = _parse_point(line_end)
-
     return AppConfig(
         source=_parse_source(args.source),
         model=args.model,
-        line_start=line_start,
-        line_end=line_end,
+        zone_left=args.zone_left,
+        zone_right=args.zone_right,
         width=args.width,
         device=args.device,
         conf=args.conf,
@@ -390,8 +409,8 @@ def main() -> None:
 
     model = YOLO(config.model)
     counter = LineCrossCounter(
-        config.line_start,
-        config.line_end,
+        config.zone_left,
+        config.zone_right,
         cross_cooldown_seconds=config.cross_cooldown_seconds,
         track_ttl_seconds=config.track_ttl_seconds,
     )
