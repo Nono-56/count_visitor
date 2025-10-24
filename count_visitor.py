@@ -21,7 +21,7 @@ from ultralytics import YOLO
 @dataclass
 class AppConfig:
     # Webカメラ番号または動画パス。0 は既定のカメラ、"rtsp://..." なども指定可能。
-    source: str | int = 0
+    source: str | int = 1
     # Ultralytics YOLO のモデル名もしくはファイルパス。軽量な yolov8n.pt を既定にする。
     model: str = "yolov8n.pt"
     # カウント領域左端の正規化 x 座標 (0.0-1.0)。
